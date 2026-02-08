@@ -33,19 +33,30 @@ fi
 # Test 2: Help flag works
 echo ""
 echo "Test 2: Help output"
-if ./agent-sync.sh --help 2>&1 | grep -q 'Usage:'; then
+help_output=$(./agent-sync.sh --help 2>&1 || true)
+if echo "$help_output" | grep -q 'Usage:'; then
   pass "--help shows usage"
 else
   fail "--help doesn't show usage"
 fi
 
-# Test 3: Fails without container ID
+# Test 3: Fails without container ID or startsync
 echo ""
 echo "Test 3: Argument validation"
-if ./agent-sync.sh 2>&1 | grep -q 'Container ID required'; then
+no_args_output=$(./agent-sync.sh 2>&1 || true)
+if echo "$no_args_output" | grep -q 'Container ID required'; then
   pass "Fails without container ID"
 else
   fail "Should fail without container ID"
+fi
+
+# Test 3b: Help mentions startsync
+echo ""
+echo "Test 3b: startsync in help"
+if echo "$help_output" | grep -q 'startsync'; then
+  pass "Help mentions startsync"
+else
+  fail "Help should mention startsync"
 fi
 
 # Test 4: Semaphore format parsing (unit test via subshell)
