@@ -71,9 +71,11 @@ err() {
 }
 
 cleanup_children() {
-  for pid in "${CHILD_PIDS[@]}"; do
-    kill "$pid" 2>/dev/null || true
-  done
+  if [ ${#CHILD_PIDS[@]} -gt 0 ]; then
+    for pid in "${CHILD_PIDS[@]}"; do
+      kill "$pid" 2>/dev/null || true
+    done
+  fi
   wait 2>/dev/null
   log "All watchers stopped."
 }
@@ -274,11 +276,11 @@ if [ "$MODE" = "startsync" ]; then
 
   trap cleanup_children EXIT INT TERM
 
-  # Launch a watcher per container
-  echo "$containers" | while IFS=$'\t' read -r id name image; do
+  # Launch a watcher per container (use process substitution to stay in current shell)
+  while IFS=$'\t' read -r id name image; do
     watch_container "$id" &
     CHILD_PIDS+=($!)
-  done
+  done <<< "$containers"
 
   # Wait for all watchers (or until interrupted)
   wait
