@@ -4,6 +4,8 @@ File semaphore-based sync from podman containers to GitHub PRs.
 
 Bridges the gap between sandboxed AI agent containers and GitHub — when an agent has changes ready, it writes a `.ready` semaphore file, and this script automatically creates a PR.
 
+> **Security warning:** This tool applies code produced by AI agents directly to your repositories and creates PRs on your behalf. A compromised or prompt-injected agent could craft patches containing malicious code, backdoors, or secrets exfiltration. **Use only with trusted AI agents.** Always review generated PRs before merging. Run agents in sandboxed containers with minimal permissions. Never point this at repositories where unreviewed commits could reach production.
+
 ## How it works
 
 ```

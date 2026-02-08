@@ -1,6 +1,13 @@
 #!/bin/bash
 # agent-sync - File semaphore-based sync from podman containers to GitHub PRs
 #
+# WARNING: This tool executes content produced by AI agents. It applies patches
+# and runs commit messages authored inside containers with minimal validation.
+# Use only with trusted AI agents in sandboxed environments. A malicious or
+# prompt-injected agent could craft patches that introduce backdoors, secrets
+# exfiltration, or other malicious code into your repositories. Always review
+# PRs before merging. Never run this against production branches without review.
+#
 # Watches a container for a .ready semaphore file, then:
 # 1. Copies the patch out of the container
 # 2. Applies it to a local repo clone
@@ -90,6 +97,7 @@ if ! command -v gh &>/dev/null; then
   exit 1
 fi
 
+log "WARNING: Only use with trusted AI agents. Review all PRs before merging."
 log "Watching container $CONTAINER"
 log "Semaphore: $SEMAPHORE"
 log "Repos base: $REPOS_BASE"
