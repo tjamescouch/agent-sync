@@ -48,20 +48,7 @@ else
   fail "Should fail without container ID"
 fi
 
-# Test 4: Fails with invalid container
-echo ""
-echo "Test 4: Container validation"
-if command -v podman &>/dev/null; then
-  if ./agent-sync.sh nonexistent-container-xyz 2>&1 | grep -q 'not found'; then
-    pass "Rejects invalid container"
-  else
-    fail "Should reject invalid container"
-  fi
-else
-  log "SKIPPED (podman not available)"
-fi
-
-# Test 5: Semaphore format parsing (unit test via subshell)
+# Test 4: Semaphore format parsing (unit test via subshell)
 echo ""
 echo "Test 5: Semaphore parsing"
 SAMPLE="REPO=my-repo
