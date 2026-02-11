@@ -42,6 +42,9 @@ ONCE=false
 DRY_RUN=false
 CONTAINER=""
 MODE="single"
+PIDFILE="${HOME}/.agentchat/agent-sync.pid"
+LOGFILE="${HOME}/.agentchat/agent-sync.log"
+BACKGROUND=false
 
 # Track child PIDs for cleanup
 CHILD_PIDS=()
@@ -49,13 +52,19 @@ CHILD_PIDS=()
 usage() {
   echo "Usage:"
   echo "  agent-sync startsync [options]         Auto-discover all agent containers"
+  echo "  agent-sync daemon [options]            Daemon mode: continuous discovery + extraction"
+  echo "  agent-sync daemon stop                 Stop a running daemon"
+  echo "  agent-sync daemon status               Show daemon status"
   echo "  agent-sync <container_id> [options]    Watch a single container"
   echo ""
   echo "Options:"
   echo "  --repos-base <dir>    Base directory for repos (default: ~/dev/claude/owl)"
   echo "  --poll <seconds>      Poll interval (default: 10)"
   echo "  --semaphore <path>    Semaphore path in container (default: /home/agent/workspace/.ready)"
-  echo "  --image <name>        Image filter for startsync (default: agentchat-agent)"
+  echo "  --image <name>        Image filter for startsync/daemon (default: agentchat-agent)"
+  echo "  --pidfile <path>      PID file for daemon (default: ~/.agentchat/agent-sync.pid)"
+  echo "  --logfile <path>      Log file for daemon (default: ~/.agentchat/agent-sync.log)"
+  echo "  --background          Fork daemon to background"
   echo "  --once                Run once and exit"
   echo "  --dry-run             Show what would happen"
   echo "  -h, --help            Show this help"
@@ -80,14 +89,27 @@ cleanup_children() {
   log "All watchers stopped."
 }
 
+DAEMON_SUBCMD=""
+
 # Parse args
 while [ $# -gt 0 ]; do
   case "$1" in
     startsync) MODE="startsync"; shift ;;
+    daemon)
+      MODE="daemon"
+      shift
+      # Check for daemon subcommands (stop, status)
+      if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+        DAEMON_SUBCMD="$1"; shift
+      fi
+      ;;
     --repos-base) REPOS_BASE="$2"; shift 2 ;;
     --poll) POLL_INTERVAL="$2"; shift 2 ;;
     --semaphore) SEMAPHORE="$2"; shift 2 ;;
     --image) IMAGE_FILTER="$2"; shift 2 ;;
+    --pidfile) PIDFILE="$2"; shift 2 ;;
+    --logfile) LOGFILE="$2"; shift 2 ;;
+    --background) BACKGROUND=true; shift ;;
     --once) ONCE=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     -h|--help) usage ;;
@@ -103,7 +125,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$MODE" = "single" ] && [ -z "$CONTAINER" ]; then
-  err "Container ID required (or use 'startsync' to auto-discover)"
+  err "Container ID required (or use 'startsync'/'daemon' to auto-discover)"
   usage
 fi
 
@@ -165,11 +187,14 @@ process_semaphore() {
     return 0
   fi
 
-  # Copy patch out
-  podman cp "$container:$patch" "$local_patch" || {
-    err "[$container_name] Failed to copy patch from container"
-    return 1
-  }
+  # Copy patch out (try podman cp first, fall back to exec cat for symlink issues)
+  if ! podman cp "$container:$patch" "$local_patch" 2>/dev/null; then
+    log "[$container_name] podman cp failed, falling back to exec cat"
+    podman exec "$container" cat "$patch" > "$local_patch" 2>/dev/null || {
+      err "[$container_name] Failed to copy patch from container"
+      return 1
+    }
+  fi
 
   # Remove semaphore (so we don't re-process)
   podman exec "$container" rm -f "$SEMAPHORE"
@@ -251,6 +276,173 @@ watch_container() {
     sleep "$POLL_INTERVAL"
   done
 }
+
+# --- daemon mode: continuous discovery + extraction ---
+daemon_cleanup() {
+  rm -f "$PIDFILE"
+  log "Daemon stopped."
+}
+
+daemon_stop() {
+  if [ ! -f "$PIDFILE" ]; then
+    echo "No daemon running (no PID file at $PIDFILE)"
+    exit 1
+  fi
+  local pid
+  pid=$(cat "$PIDFILE")
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "Stopping agent-sync daemon (PID $pid)..."
+    kill "$pid"
+    # Wait up to 10s for clean exit
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && [ $waited -lt 10 ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "Daemon didn't stop cleanly, sending SIGKILL..."
+      kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$PIDFILE"
+    echo "Daemon stopped."
+  else
+    echo "Stale PID file (process $pid not running). Cleaning up."
+    rm -f "$PIDFILE"
+  fi
+  exit 0
+}
+
+daemon_status() {
+  if [ ! -f "$PIDFILE" ]; then
+    echo "No daemon running (no PID file at $PIDFILE)"
+    exit 0
+  fi
+  local pid
+  pid=$(cat "$PIDFILE")
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "agent-sync daemon running (PID $pid)"
+    echo "PID file: $PIDFILE"
+    echo "Log file: $LOGFILE"
+    # Show recent extractions from log
+    if [ -f "$LOGFILE" ]; then
+      local extractions
+      extractions=$(grep -c "Semaphore detected" "$LOGFILE" 2>/dev/null || echo "0")
+      echo "Total extractions: $extractions"
+      echo "Last 3 log lines:"
+      tail -3 "$LOGFILE" | sed 's/^/  /'
+    fi
+  else
+    echo "Stale PID file (process $pid not running). Cleaning up."
+    rm -f "$PIDFILE"
+  fi
+  exit 0
+}
+
+daemon_sweep() {
+  # Single sweep: discover all containers, check each for semaphores
+  local containers
+  containers=$(podman ps --format '{{.ID}}' --filter "label=agentchat.agent=true" 2>/dev/null || true)
+
+  # Fallback to image name filter if no labeled containers found
+  if [ -z "$containers" ]; then
+    containers=$(podman ps --format '{{.ID}}\t{{.Image}}' 2>/dev/null | grep "$IMAGE_FILTER" | cut -f1 || true)
+  fi
+
+  if [ -z "$containers" ]; then
+    return 0
+  fi
+
+  local count=0
+  while IFS= read -r container_id; do
+    [ -z "$container_id" ] && continue
+
+    # Check container is still running
+    if ! podman inspect "$container_id" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+      continue
+    fi
+
+    # Check for semaphore
+    if podman exec "$container_id" test -f "$SEMAPHORE" 2>/dev/null; then
+      local cname
+      cname=$(podman inspect "$container_id" --format '{{.Name}}' 2>/dev/null || echo "$container_id")
+      log "Semaphore detected in $cname!"
+      process_semaphore "$container_id" || true
+      count=$((count + 1))
+    fi
+  done <<< "$containers"
+
+  if [ $count -gt 0 ]; then
+    log "Sweep complete: extracted from $count container(s)"
+  fi
+}
+
+daemon_run() {
+  mkdir -p "$(dirname "$PIDFILE")"
+
+  # Check for existing daemon (skip when launched via --background, parent handles PID)
+  if [ "${_DAEMON_BG:-}" != "1" ]; then
+    if [ -f "$PIDFILE" ]; then
+      local existing_pid
+      existing_pid=$(cat "$PIDFILE")
+      if kill -0 "$existing_pid" 2>/dev/null; then
+        err "Daemon already running (PID $existing_pid). Use 'daemon stop' first."
+        exit 1
+      else
+        log "Removing stale PID file"
+        rm -f "$PIDFILE"
+      fi
+    fi
+    echo $$ > "$PIDFILE"
+  fi
+  trap daemon_cleanup EXIT INT TERM
+
+  log "Daemon started (PID $$)"
+  log "Image filter: *${IMAGE_FILTER}*"
+  log "Semaphore: $SEMAPHORE"
+  log "Repos base: $REPOS_BASE"
+  log "Poll interval: ${POLL_INTERVAL}s"
+  [ "$DRY_RUN" = true ] && log "DRY RUN MODE"
+
+  # Main loop: sweep all containers every POLL_INTERVAL
+  while true; do
+    daemon_sweep
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+if [ "$MODE" = "daemon" ]; then
+  case "$DAEMON_SUBCMD" in
+    stop) daemon_stop ;;
+    status) daemon_status ;;
+    "")
+      if [ "$BACKGROUND" = true ]; then
+        mkdir -p "$(dirname "$LOGFILE")" "$(dirname "$PIDFILE")"
+        # Check for existing daemon before forking
+        if [ -f "$PIDFILE" ]; then
+          existing_pid=$(cat "$PIDFILE")
+          if kill -0 "$existing_pid" 2>/dev/null; then
+            err "Daemon already running (PID $existing_pid). Use 'daemon stop' first."
+            exit 1
+          else
+            log "Removing stale PID file"
+            rm -f "$PIDFILE"
+          fi
+        fi
+        log "Starting daemon in background (log: $LOGFILE)"
+        _DAEMON_BG=1 daemon_run >> "$LOGFILE" 2>&1 &
+        DAEMON_PID=$!
+        echo "$DAEMON_PID" > "$PIDFILE"
+        disown
+        echo "Daemon started in background (PID $DAEMON_PID)"
+        exit 0
+      else
+        daemon_run
+      fi
+      ;;
+    *) err "Unknown daemon subcommand: $DAEMON_SUBCMD"; usage ;;
+  esac
+  exit 0
+fi
 
 # --- startsync mode: auto-discover and watch all agent containers ---
 if [ "$MODE" = "startsync" ]; then
