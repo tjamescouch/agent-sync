@@ -35,6 +35,7 @@ set -euo pipefail
 
 # Defaults
 REPOS_BASE="${HOME}/dev/claude/owl"
+WORMHOLE="${HOME}/dev/claude/wormhole"
 POLL_INTERVAL=10
 SEMAPHORE="/home/agent/workspace/.ready"
 IMAGE_FILTER="agentchat-agent"
@@ -45,6 +46,7 @@ MODE="single"
 PIDFILE="${HOME}/.agentchat/agent-sync.pid"
 LOGFILE="${HOME}/.agentchat/agent-sync.log"
 BACKGROUND=false
+LIMA_INSTANCE=""  # When set, wrap all podman calls with: limactl shell <instance> --
 
 # Track child PIDs for cleanup
 CHILD_PIDS=()
@@ -112,6 +114,7 @@ while [ $# -gt 0 ]; do
     --background) BACKGROUND=true; shift ;;
     --once) ONCE=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
+    --lima) LIMA_INSTANCE="$2"; shift 2 ;;
     -h|--help) usage ;;
     -*) err "Unknown option: $1"; exit 1 ;;
     *)
@@ -129,14 +132,27 @@ if [ "$MODE" = "single" ] && [ -z "$CONTAINER" ]; then
   usage
 fi
 
+# Build podman command array (supports --lima for Lima VM containers)
+if [ -n "$LIMA_INSTANCE" ]; then
+  PODMAN=(limactl shell "$LIMA_INSTANCE" -- podman)
+  log "Using Lima instance: $LIMA_INSTANCE"
+else
+  PODMAN=(podman)
+fi
+
 # Verify gh is available
 if ! command -v gh &>/dev/null; then
   err "gh CLI not found. Install: https://cli.github.com"
   exit 1
 fi
 
-# Verify podman is available
-if ! command -v podman &>/dev/null; then
+# Verify podman/limactl is available
+if [ -n "$LIMA_INSTANCE" ]; then
+  if ! command -v limactl &>/dev/null; then
+    err "limactl not found. Install Lima: https://lima-vm.io"
+    exit 1
+  fi
+elif ! command -v podman &>/dev/null; then
   err "podman not found. Install: https://podman.io"
   exit 1
 fi
@@ -150,10 +166,37 @@ process_semaphore() {
 
   # Read semaphore content
   local content
-  content=$(podman exec "$container" cat "$SEMAPHORE" 2>/dev/null) || {
+  content=$("${PODMAN[@]}" exec "$container" cat "$SEMAPHORE" 2>/dev/null) || {
     err "[$container_name] Failed to read semaphore"
     return 1
   }
+
+  # Check for raw-copy mode (empty .ready = just copy files to wormhole)
+  local trimmed
+  trimmed=$(echo "$content" | tr -d '[:space:]')
+  if [ -z "$trimmed" ]; then
+    log "[$container_name] Empty semaphore — raw copy mode"
+    local dest="$WORMHOLE/$container_name"
+    mkdir -p "$dest"
+    if [ "$DRY_RUN" = true ]; then
+      log "[$container_name] [dry-run] Would copy workspace to $dest"
+      "${PODMAN[@]}" exec "$container" rm -f "$SEMAPHORE"
+      return 0
+    fi
+    local workspace_dir
+    workspace_dir=$(dirname "$SEMAPHORE")
+    "${PODMAN[@]}" cp "$container:$workspace_dir/." "$dest/" 2>/dev/null || {
+      log "[$container_name] podman cp failed, falling back to tar"
+      "${PODMAN[@]}" exec "$container" tar -cf - -C "$workspace_dir" . 2>/dev/null | tar -xf - -C "$dest/" || {
+        err "[$container_name] Failed to copy workspace from container"
+        return 1
+      }
+    }
+    rm -f "$dest/.ready"
+    "${PODMAN[@]}" exec "$container" rm -f "$SEMAPHORE"
+    log "[$container_name] Files copied to $dest"
+    return 0
+  fi
 
   # Parse fields
   local repo patch branch message
@@ -188,16 +231,16 @@ process_semaphore() {
   fi
 
   # Copy patch out (try podman cp first, fall back to exec cat for symlink issues)
-  if ! podman cp "$container:$patch" "$local_patch" 2>/dev/null; then
+  if ! "${PODMAN[@]}" cp "$container:$patch" "$local_patch" 2>/dev/null; then
     log "[$container_name] podman cp failed, falling back to exec cat"
-    podman exec "$container" cat "$patch" > "$local_patch" 2>/dev/null || {
+    "${PODMAN[@]}" exec "$container" cat "$patch" > "$local_patch" 2>/dev/null || {
       err "[$container_name] Failed to copy patch from container"
       return 1
     }
   fi
 
   # Remove semaphore (so we don't re-process)
-  podman exec "$container" rm -f "$SEMAPHORE"
+  "${PODMAN[@]}" exec "$container" rm -f "$SEMAPHORE"
 
   # Verify repo exists
   if [ ! -d "$repo_dir/.git" ]; then
@@ -253,18 +296,18 @@ Branch: \`$full_branch\`"
 watch_container() {
   local container="$1"
   local container_name
-  container_name=$(podman inspect "$container" --format '{{.Name}}' 2>/dev/null || echo "$container")
+  container_name=$("${PODMAN[@]}" inspect "$container" --format '{{.Name}}' 2>/dev/null || echo "$container")
 
   log "[$container_name] Watching (semaphore: $SEMAPHORE)"
 
   while true; do
     # Check container is still running
-    if ! podman inspect "$container" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+    if ! "${PODMAN[@]}" inspect "$container" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
       log "[$container_name] Container stopped, exiting watcher"
       return 0
     fi
 
-    if podman exec "$container" test -f "$SEMAPHORE" 2>/dev/null; then
+    if "${PODMAN[@]}" exec "$container" test -f "$SEMAPHORE" 2>/dev/null; then
       log "[$container_name] Semaphore detected!"
       process_semaphore "$container" || true
     fi
